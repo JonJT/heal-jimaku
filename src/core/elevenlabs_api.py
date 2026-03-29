@@ -306,26 +306,26 @@ class ElevenLabsSTTClient:
             if duration:
                 self._log(f"音频信息: {duration:.2f}s, {file_size:.2f}MB")
 
-            # 发送请求
-            with open(audio_file_path, "rb") as f:
-                # 根据文件扩展名确定MIME类型
-                file_extension = os.path.splitext(audio_file_path)[1].lower()
-                mime_type_map = {
-                    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac",
-                    ".m4a": "audio/mp4", ".ogg": "audio/ogg", ".opus": "audio/opus",
-                    ".aac": "audio/aac", ".webm": "audio/webm", ".mp4": "video/mp4",
-                    ".mov": "video/quicktime"
-                }
-                mime_type = mime_type_map.get(file_extension, 'application/octet-stream')
+            # 根据文件扩展名确定MIME类型
+            file_extension = os.path.splitext(audio_file_path)[1].lower()
+            mime_type_map = {
+                ".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac",
+                ".m4a": "audio/mp4", ".ogg": "audio/ogg", ".opus": "audio/opus",
+                ".aac": "audio/aac", ".webm": "audio/webm", ".mp4": "video/mp4",
+                ".mov": "video/quicktime"
+            }
+            mime_type = mime_type_map.get(file_extension, 'application/octet-stream')
 
-                files = {"file": (os.path.basename(audio_file_path), f, mime_type)}
+            # 添加重试机制 - 修复网络超时问题
+            max_retries = 3
+            retry_delay = 5  # 秒
 
-                # 添加重试机制 - 修复网络超时问题
-                max_retries = 3
-                retry_delay = 5  # 秒
+            for attempt in range(max_retries):
+                try:
+                    # 每次重试都重新打开文件，避免复用已读到末尾的句柄
+                    with open(audio_file_path, "rb") as f:
+                        files = {"file": (os.path.basename(audio_file_path), f, mime_type)}
 
-                for attempt in range(max_retries):
-                    try:
                         # 根据模式使用不同的发送方式
                         if api_key:
                             # 付费版：不使用URL参数，只使用表单数据
@@ -349,21 +349,21 @@ class ElevenLabsSTTClient:
                                 timeout=(120, 1800) # 修复：增加连接超时到120秒，应对网络波动
                             )
 
-                        # 如果成功发送，跳出重试循环
-                        break
+                    # 如果成功发送，跳出重试循环
+                    break
 
-                    except (requests.exceptions.Timeout,
-                            requests.exceptions.ConnectionError,
-                            ConnectionError,
-                            TimeoutError) as e:
-                        if attempt < max_retries - 1:  # 不是最后一次尝试
-                            self._log(f"网络超时，{retry_delay}秒后重试... 错误: {str(e)}")
-                            time.sleep(retry_delay)
-                            retry_delay *= 2  # 指数退避：5s, 10s, 20s
-                        else:
-                            # 最后一次尝试失败，重新抛出异常
-                            self._log(f"重试{max_retries}次后仍然失败")
-                            raise
+                except (requests.exceptions.Timeout,
+                        requests.exceptions.ConnectionError,
+                        ConnectionError,
+                        TimeoutError) as e:
+                    if attempt < max_retries - 1:  # 不是最后一次尝试
+                        self._log(f"网络超时，{retry_delay}秒后重试... 错误: {str(e)}")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # 指数退避：5s, 10s, 20s
+                    else:
+                        # 最后一次尝试失败，重新抛出异常
+                        self._log(f"重试{max_retries}次后仍然失败")
+                        raise
 
             if response.status_code == 200:
                 result = response.json()

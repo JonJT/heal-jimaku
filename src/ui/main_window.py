@@ -2966,6 +2966,8 @@ class HealJimakuApp(QMainWindow):
             else:
                 if "任务已提前停止" in msg:
                     self.show_message_box(self, "任务已停止", msg, True)
+                elif msg.startswith("批量处理完成，但以下文件处理失败"):
+                    self.show_message_box(self, "批量处理结果", msg, False)
                 else:
                     self.show_message_box(self, "错误", f"处理失败: {msg}", False)
 

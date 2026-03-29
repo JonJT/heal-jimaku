@@ -8,7 +8,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from core.transcription_parser import TranscriptionParser
 from core.srt_processor import SrtProcessor
-from core.llm_api import call_llm_api_for_segmentation
+from core.llm_api import call_llm_api_for_segmentation, LlmChunkProcessingError
 from core.data_models import ParsedTranscription
 from core.elevenlabs_api import ElevenLabsSTTClient
 from core.soniox_api import SonioxClient, SonioxTranscriptionConfig
@@ -432,16 +432,20 @@ class ConversionWorker(QObject):
 
             # 调用LLM API进行文本分割
             self.signals.log_message.emit(f"调用LLM API进行文本分割 (URL配置: '{llm_base_url_str}', 模型: '{llm_model_name}', 温度: {llm_temperature}, API格式: {llm_api_format})...")
-            llm_segments = call_llm_api_for_segmentation(
-                api_key=llm_api_key,
-                text_to_segment=text_to_segment,
-                custom_api_base_url_str=llm_base_url_str,
-                custom_model_name=llm_model_name,
-                custom_temperature=llm_temperature,
-                signals_forwarder=self.signals,
-                target_language=llm_target_language_for_api,
-                api_format=llm_api_format  # 传递API格式参数
-            )
+            try:
+                llm_segments = call_llm_api_for_segmentation(
+                    api_key=llm_api_key,
+                    text_to_segment=text_to_segment,
+                    custom_api_base_url_str=llm_base_url_str,
+                    custom_model_name=llm_model_name,
+                    custom_temperature=llm_temperature,
+                    signals_forwarder=self.signals,
+                    target_language=llm_target_language_for_api,
+                    api_format=llm_api_format  # 传递API格式参数
+                )
+            except LlmChunkProcessingError as e:
+                current_json_name = os.path.basename(generated_json_path) if generated_json_path else "未知JSON文件"
+                self.signals.finished.emit(f"LLM分段失败，当前JSON文件 '{current_json_name}' 处理失败：{e}", False); return
             if not self.is_running : self.signals.finished.emit("任务在LLM API调用期间被取消。", False); return
             if llm_segments is None: self.signals.finished.emit("LLM API 调用失败或返回空。", False); return
 

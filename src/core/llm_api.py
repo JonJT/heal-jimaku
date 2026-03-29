@@ -28,6 +28,16 @@ DEFAULT_SYSTEM_PROMPT_FOR_SUMMARY = app_config.DEEPSEEK_SYSTEM_PROMPT_SUMMARY_EN
 MAX_CHARS_PER_CHUNK = 2800
 
 
+class LlmChunkProcessingError(RuntimeError):
+    """Raised when a single LLM segmentation chunk exhausts all retries."""
+
+    def __init__(self, chunk_index: int, num_chunks: int, last_error: str):
+        self.chunk_index = chunk_index
+        self.num_chunks = num_chunks
+        self.last_error = last_error
+        super().__init__(f"块 {chunk_index}/{num_chunks} 在多次重试后仍失败: {last_error}")
+
+
 def _is_reasoning_model(model_name: str) -> bool:
     """
     判断是否为reasoning模型（需要特殊参数处理）
@@ -636,111 +646,138 @@ def call_llm_api_for_segmentation(
         if text_to_segment.strip(): text_chunks = [text_to_segment]; num_chunks = 1
         else: return []
 
+    max_chunk_retries = 5
     for i, chunk in enumerate(text_chunks):
-        if not is_running(): _log_main_api(f"处理块 {i+1}/{num_chunks} 前任务已取消。"); return all_segments if all_segments else None 
-        _log_main_api(f"向 LLM API 发送块 {i+1}/{num_chunks} 进行分割 (URL: {target_url}, 模型: {effective_model}, 温度: {effective_temperature})...")
-        
+        if not is_running(): _log_main_api(f"处理块 {i+1}/{num_chunks} 前任务已取消。"); return all_segments if all_segments else None
+
         user_content_with_summary = f"【全文摘要】:\n{summary_text}\n\n【当前文本块】:\n{chunk}"
-        if not summary_text: user_content_with_summary = f"【当前文本块】:\n{chunk}"
+        if not summary_text:
+            user_content_with_summary = f"【当前文本块】:\n{chunk}"
 
-        # [FIX] 根据 API 格式构建请求 - 使用检测后的有效格式
-        if effective_api_format == app_config.API_FORMAT_GEMINI:
-            # Gemini API 使用不同的请求格式和认证方式
-            payload = {
-                "contents": [{"parts": [{"text": f"系统提示：{system_prompt_segmentation}\n\n用户输入：{user_content_with_summary}"}]}],
-                "generationConfig": {
-                    "temperature": effective_temperature,
-                    "maxOutputTokens": 8192
-                }
-            }
-            # Gemini API 使用 URL 参数传递 API key（即使是代理也要这样）
-            response = requests.post(f"{target_url}?key={api_key}", json=payload, timeout=180)
-        elif effective_api_format == app_config.API_FORMAT_CLAUDE:
-            # Claude API 使用 /v1/messages 格式
-            payload = {
-                "model": effective_model,
-                "max_tokens": 8192,
-                "messages": [{"role": "user", "content": f"系统提示：{system_prompt_segmentation}\n\n用户输入：{user_content_with_summary}"}]
-            }
-            if custom_temperature is not None: payload["temperature"] = effective_temperature
+        chunk_processed = False
+        last_error_message = "未知错误"
 
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-                "anthropic-version": "2023-06-01"
-            }
-            response = requests.post(target_url, headers=headers, json=payload, timeout=180)
-        else:
-            # OpenAI 兼容格式 (默认格式，包括 AUTO 模式)
-            payload = {"model": effective_model, "messages": [{"role": "system", "content": system_prompt_segmentation}, {"role": "user", "content": user_content_with_summary }]}
-            
-            # [FIX] Reasoning模型（GPT-5系列、o系列）需要特殊处理
-            if _is_reasoning_model(effective_model):
-                # 使用 max_completion_tokens 而不是 max_tokens
-                payload["max_completion_tokens"] = 8192
-                # 不传 temperature，使用模型默认值
-            else:
-                # 传统模型使用 max_tokens 和自定义 temperature
-                payload["max_tokens"] = 8192
-                if custom_temperature is not None:
-                    payload["temperature"] = effective_temperature
+        for attempt in range(max_chunk_retries):
+            if not is_running(): _log_main_api(f"处理块 {i+1}/{num_chunks} 的第 {attempt+1} 次尝试前任务已取消。"); return all_segments if all_segments else None
+            _log_main_api(f"向 LLM API 发送块 {i+1}/{num_chunks} 进行分割 (尝试 {attempt+1}/{max_chunk_retries}, URL: {target_url}, 模型: {effective_model}, 温度: {effective_temperature})...")
 
-            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-            response = requests.post(target_url, headers=headers, json=payload, timeout=180)
+            try:
+                # [FIX] 根据 API 格式构建请求 - 使用检测后的有效格式
+                if effective_api_format == app_config.API_FORMAT_GEMINI:
+                    payload = {
+                        "contents": [{"parts": [{"text": f"系统提示：{system_prompt_segmentation}\n\n用户输入：{user_content_with_summary}"}]}],
+                        "generationConfig": {
+                            "temperature": effective_temperature,
+                            "maxOutputTokens": 8192
+                        }
+                    }
+                    response = requests.post(f"{target_url}?key={api_key}", json=payload, timeout=180)
+                elif effective_api_format == app_config.API_FORMAT_CLAUDE:
+                    payload = {
+                        "model": effective_model,
+                        "max_tokens": 8192,
+                        "messages": [{"role": "user", "content": f"系统提示：{system_prompt_segmentation}\n\n用户输入：{user_content_with_summary}"}]
+                    }
+                    if custom_temperature is not None:
+                        payload["temperature"] = effective_temperature
 
-        try:
-            if not is_running(): _log_main_api(f"API 对块 {i+1}/{num_chunks} 响应接收后任务已取消。"); return all_segments if all_segments else None
-            response.raise_for_status(); data = response.json()
-            if not is_running(): _log_main_api(f"API 对块 {i+1}/{num_chunks} 响应解析后任务已取消。"); return all_segments if all_segments else None
-            content = None; finish_reason = "unknown"
-            if "choices" in data and data["choices"] and isinstance(data["choices"], list) and len(data["choices"]) > 0 and \
-               isinstance(data["choices"][0], dict) and data["choices"][0].get("message", {}).get("content") is not None:
-                choice = data["choices"][0]; content = choice.get("message", {}).get("content"); finish_reason = choice.get("finish_reason", "unknown")
-            elif data.get("candidates") and isinstance(data["candidates"], list) and len(data["candidates"]) > 0 and \
-                 isinstance(data["candidates"][0], dict) and \
-                 data["candidates"][0].get("content", {}).get("parts", [{}]) and \
-                 isinstance(data["candidates"][0].get("content").get("parts"), list) and \
-                 len(data["candidates"][0].get("content").get("parts")) > 0 and \
-                 isinstance(data["candidates"][0].get("content").get("parts")[0], dict) and \
-                 data["candidates"][0].get("content").get("parts")[0].get("text") is not None:
-                content = data["candidates"][0].get("content").get("parts")[0].get("text"); finish_reason = data["candidates"][0].get("finishReason", "unknown")
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}",
+                        "anthropic-version": "2023-06-01"
+                    }
+                    response = requests.post(target_url, headers=headers, json=payload, timeout=180)
+                else:
+                    payload = {"model": effective_model, "messages": [{"role": "system", "content": system_prompt_segmentation}, {"role": "user", "content": user_content_with_summary}]}
+                    if _is_reasoning_model(effective_model):
+                        payload["max_completion_tokens"] = 8192
+                    else:
+                        payload["max_tokens"] = 8192
+                        if custom_temperature is not None:
+                            payload["temperature"] = effective_temperature
 
-            if content is not None:
+                    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+                    response = requests.post(target_url, headers=headers, json=payload, timeout=180)
+
+                if not is_running(): _log_main_api(f"API 对块 {i+1}/{num_chunks} 响应接收后任务已取消。"); return all_segments if all_segments else None
+                response.raise_for_status()
+                data = response.json()
+                if not is_running(): _log_main_api(f"API 对块 {i+1}/{num_chunks} 响应解析后任务已取消。"); return all_segments if all_segments else None
+
+                content = None
+                finish_reason = "unknown"
+                if "choices" in data and data["choices"] and isinstance(data["choices"], list) and len(data["choices"]) > 0 and \
+                   isinstance(data["choices"][0], dict) and data["choices"][0].get("message", {}).get("content") is not None:
+                    choice = data["choices"][0]
+                    content = choice.get("message", {}).get("content")
+                    finish_reason = choice.get("finish_reason", "unknown")
+                elif data.get("candidates") and isinstance(data["candidates"], list) and len(data["candidates"]) > 0 and \
+                     isinstance(data["candidates"][0], dict) and \
+                     data["candidates"][0].get("content", {}).get("parts", [{}]) and \
+                     isinstance(data["candidates"][0].get("content").get("parts"), list) and \
+                     len(data["candidates"][0].get("content").get("parts")) > 0 and \
+                     isinstance(data["candidates"][0].get("content").get("parts")[0], dict) and \
+                     data["candidates"][0].get("content").get("parts")[0].get("text") is not None:
+                    content = data["candidates"][0].get("content").get("parts")[0].get("text")
+                    finish_reason = data["candidates"][0].get("finishReason", "unknown")
+
+                if content is None:
+                    error_info = data.get('error', {})
+                    if not error_info and data.get("code") and data.get("message"):
+                        error_info = data
+                    error_msg = error_info.get('message', str(data))
+                    error_type = error_info.get('type', error_info.get("status"))
+                    error_code_val = error_info.get('code')
+                    raise ValueError(f"响应格式错误或API返回错误。类型: {error_type}, Code: {error_code_val}, 消息: {error_msg}")
+
                 raw_segments = [seg.strip() for seg in content.split('\n') if seg.strip()]
-                segments_from_chunk = []
+                if len(raw_segments) == 0:
+                    raise ValueError("响应成功但未返回任何文本片段")
 
-                # 处理分割结果
-                if len(raw_segments) > 0:
-                    _log_main_api(f"块 {i+1}/{num_chunks} 成功获得 {len(raw_segments)} 个文本片段")
-
-                # 预处理：检测并修正括号内容混合的分割
+                _log_main_api(f"块 {i+1}/{num_chunks} 成功获得 {len(raw_segments)} 个文本片段")
                 preprocessed_segments = _preprocess_bracket_mixed_segments(raw_segments, _log_main_api)
-
-                # 验证并可能修正分割结果
                 segments_from_chunk = _validate_and_fix_segments(preprocessed_segments, _log_main_api)
+                if len(segments_from_chunk) == 0:
+                    raise ValueError("分段结果经校验后为空")
 
                 all_segments.extend(segments_from_chunk)
                 _log_main_api(f"块 {i+1}/{num_chunks} 修正后获得 {len(segments_from_chunk)} 个片段。完成原因: {finish_reason}")
                 if finish_reason == "length" or finish_reason == "MAX_TOKENS":
                     _log_main_api(f"警告: 块 {i+1}/{num_chunks} 的输出可能因为达到API的默认max_tokens限制而被截断。")
-            else: 
-                error_info = data.get('error', {}); 
-                if not error_info and data.get("code") and data.get("message"): error_info = data 
-                error_msg = error_info.get('message', str(data)); error_type = error_info.get('type', error_info.get("status")); error_code_val = error_info.get('code')
-                _log_main_api(f"错误: LLM API 对块 {i+1}/{num_chunks} 的响应格式错误或API返回错误。类型: {error_type}, Code: {error_code_val}, 消息: {str(data)[:500]}")
-        except requests.exceptions.Timeout: _log_main_api(f"错误: LLM API 对块 {i+1}/{num_chunks} 的请求超时 (180秒)。URL: {target_url}")
-        except requests.exceptions.RequestException as e: 
-            error_details = ""; status_code = 'N/A'
-            if e.response is not None:
-                status_code = e.response.status_code
-                try: 
-                    err_json_data = e.response.json(); err_info_openai = err_json_data.get('error', {}); err_info_gemini = err_json_data if "message" in err_json_data and "code" in err_json_data else {}
-                    message = err_info_openai.get('message', err_info_gemini.get('message', e.response.text)); err_type = err_info_openai.get('type', err_info_gemini.get('status', 'UnknownType')); err_code = err_info_openai.get('code', err_info_gemini.get('code', 'UnknownCode'))
-                    error_details = f": [{err_type}/{err_code}] {message}"
-                except requests.exceptions.JSONDecodeError: error_details = f": {e.response.text[:200]}"
-            else: error_details = f": {str(e)}"
-            _log_main_api(f"错误: LLM API 对块 {i+1}/{num_chunks} 的请求失败 (状态码: {status_code}, URL: {target_url}){error_details}")
-        except Exception as e: _log_main_api(f"错误: 处理 LLM API 对块 {i+1}/{num_chunks} 的响应时发生未知错误 (URL: {target_url}): {e}"); _log_main_api(traceback.format_exc())
+                chunk_processed = True
+                break
+            except requests.exceptions.Timeout:
+                last_error_message = f"请求超时 (180秒)。URL: {target_url}"
+                _log_main_api(f"错误: LLM API 对块 {i+1}/{num_chunks} 的请求超时 (尝试 {attempt+1}/{max_chunk_retries})。URL: {target_url}")
+            except requests.exceptions.RequestException as e:
+                error_details = ""
+                status_code = 'N/A'
+                if e.response is not None:
+                    status_code = e.response.status_code
+                    try:
+                        err_json_data = e.response.json(); err_info_openai = err_json_data.get('error', {}); err_info_gemini = err_json_data if "message" in err_json_data and "code" in err_json_data else {}
+                        message = err_info_openai.get('message', err_info_gemini.get('message', e.response.text)); err_type = err_info_openai.get('type', err_info_gemini.get('status', 'UnknownType')); err_code = err_info_openai.get('code', err_info_gemini.get('code', 'UnknownCode'))
+                        error_details = f"[{err_type}/{err_code}] {message}"
+                    except requests.exceptions.JSONDecodeError:
+                        error_details = e.response.text[:200]
+                else:
+                    error_details = str(e)
+                last_error_message = f"请求失败 (状态码: {status_code}, URL: {target_url}): {error_details}"
+                _log_main_api(f"错误: LLM API 对块 {i+1}/{num_chunks} 的请求失败 (尝试 {attempt+1}/{max_chunk_retries})。{last_error_message}")
+            except Exception as e:
+                last_error_message = str(e)
+                _log_main_api(f"错误: 处理 LLM API 对块 {i+1}/{num_chunks} 的响应时发生错误 (尝试 {attempt+1}/{max_chunk_retries}, URL: {target_url}): {e}")
+                _log_main_api(traceback.format_exc())
+
+            if attempt < max_chunk_retries - 1:
+                retry_delay = min(2 ** attempt, 8)
+                _log_main_api(f"块 {i+1}/{num_chunks} 将在 {retry_delay} 秒后重试。")
+                time.sleep(retry_delay)
+
+        if not chunk_processed:
+            _log_main_api(f"错误: 块 {i+1}/{num_chunks} 在 {max_chunk_retries} 次尝试后仍失败，终止当前文件处理。")
+            raise LlmChunkProcessingError(i + 1, num_chunks, last_error_message)
+
         if signals_forwarder and hasattr(signals_forwarder, 'llm_progress_signal') and hasattr(signals_forwarder.llm_progress_signal, 'emit'):
              signals_forwarder.llm_progress_signal.emit(int(((i + 1) / num_chunks) * 100))
         if num_chunks > 1 and i < num_chunks - 1:

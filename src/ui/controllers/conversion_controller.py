@@ -78,6 +78,7 @@ class ConversionController(QObject):
         self._batch_queue = list(files)
         self._current_batch_index = 0
         self._batch_stopped = False  # 重置停止标志
+        self._batch_failed_files = []
         self._output_dir = output_dir
         self._cloud_params = cloud_params
         self._mode = mode
@@ -160,8 +161,15 @@ class ConversionController(QObject):
                 self.log_message.emit(f"批量处理已停止，已完成 {completed_count}/{total_count} 个文件")
                 self.task_finished.emit("任务已提前停止", False)
             else:
-                self.log_message.emit("批量处理完成！")
-                self.task_finished.emit("所有文件已成功处理", True)
+                if self._batch_failed_files:
+                    failed_summary = "批量处理完成，但以下文件处理失败：\n" + "\n".join(
+                        f"- {file_name}" for file_name in self._batch_failed_files
+                    )
+                    self.log_message.emit(failed_summary)
+                    self.task_finished.emit(failed_summary, False)
+                else:
+                    self.log_message.emit("批量处理完成！")
+                    self.task_finished.emit("所有文件已成功处理", True)
             return
 
         current_file = self._batch_queue[self._current_batch_index]
@@ -329,7 +337,13 @@ class ConversionController(QObject):
         # 处理业务逻辑（批处理或单任务完成）
         if self._is_batch:
             if not success:
-                self.log_message.emit(f"处理失败: {msg}")
+                failed_file = None
+                if hasattr(self, '_batch_queue') and self._current_batch_index < len(self._batch_queue):
+                    failed_file = os.path.basename(self._batch_queue[self._current_batch_index])
+                if failed_file:
+                    self._batch_failed_files.append(failed_file)
+                    self.log_message.emit(f"处理失败，已跳过当前文件: {failed_file}")
+                self.log_message.emit(f"失败详情: {msg}")
             else:
                 self.log_message.emit("处理成功。")
 
